@@ -1,0 +1,10 @@
+# Generated database — too large for git (3.6 GB). Build it locally with:
+#   python msisdn_lookup.py build
+hashes.bin
+*.bin.tmp
+*.chunk
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

@@ -12,9 +12,13 @@ import tempfile
 import time
 from pathlib import Path
 
-PHONE_PREFIX = b"2547"
+# Two Kenyan mobile prefixes (Safaricom owns both):
+#   global index   0 –  99,999,999  →  2547XXXXXXXX
+#   global index 100,000,000 – 199,999,999  →  2541XXXXXXXX
+PREFIXES = [b"2547", b"2541"]
 SUFFIX_DIGITS = 8
-TOTAL_NUMBERS = 10 ** SUFFIX_DIGITS
+NUMBERS_PER_PREFIX = 10 ** SUFFIX_DIGITS          # 100,000,000
+TOTAL_NUMBERS = NUMBERS_PER_PREFIX * len(PREFIXES) # 200,000,000
 
 HASH_SIZE = 32
 SUFFIX_SIZE = 4
@@ -23,18 +27,26 @@ RECORD_SIZE = HASH_SIZE + SUFFIX_SIZE
 DEFAULT_DB = Path(__file__).parent / "hashes.bin"
 
 
-def _hash_suffix(suffix: int) -> bytes:
-    phone = PHONE_PREFIX + f"{suffix:0{SUFFIX_DIGITS}d}".encode()
+def _hash_number(global_index: int) -> bytes:
+    prefix = PREFIXES[global_index // NUMBERS_PER_PREFIX]
+    suffix = global_index % NUMBERS_PER_PREFIX
+    phone = prefix + f"{suffix:0{SUFFIX_DIGITS}d}".encode()
     return hashlib.sha256(phone).digest()
+
+
+def _decode_global_index(v: int) -> str:
+    prefix = PREFIXES[v // NUMBERS_PER_PREFIX].decode()
+    suffix = v % NUMBERS_PER_PREFIX
+    return f"{prefix}{suffix:0{SUFFIX_DIGITS}d}"
 
 
 def _build_chunk(args: tuple) -> str:
     start, end, tmp_dir = args
 
     records = []
-    for suffix in range(start, end):
-        h = _hash_suffix(suffix)
-        records.append(h + struct.pack(">I", suffix))
+    for global_idx in range(start, end):
+        h = _hash_number(global_idx)
+        records.append(h + struct.pack(">I", global_idx))
 
     records.sort()
 
@@ -102,7 +114,7 @@ def cmd_build(args) -> None:
 
     print("Building MSISDN lookup database")
     print(f"  Output:    {db_path}")
-    print(f"  Numbers:   {TOTAL_NUMBERS:,}  (254700000000 – 254799999999)")
+    print(f"  Numbers:   {TOTAL_NUMBERS:,}  (2547XXXXXXXX + 2541XXXXXXXX, 100M each)")
     print(f"  Est. size: {est_bytes / 1e9:.2f} GB")
     print(f"  Chunks:    {n_chunks} × {chunk_size:,} records")
     print(f"  Workers:   {workers}")
@@ -218,13 +230,13 @@ def cmd_lookup(args) -> None:
 
     with open(db_path, "rb") as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            suffix = _binary_search(mm, target, n_records)
+            global_index = _binary_search(mm, target, n_records)
 
-    if suffix is None:
+    if global_index is None:
         print("Not found")
         sys.exit(1)
 
-    print(f"2547{suffix:0{SUFFIX_DIGITS}d}")
+    print(_decode_global_index(global_index))
 
 
 def cmd_info(args) -> None:
@@ -241,12 +253,60 @@ def cmd_info(args) -> None:
     print(f"Database:  {db_path}")
     print(f"Size:      {size / 1e9:.3f} GB  ({size:,} bytes)")
     print(f"Records:   {n_records:,} of {TOTAL_NUMBERS:,} ({n_records/TOTAL_NUMBERS*100:.1f}%)")
-    print(f"Coverage:  254700000000 – 254799999999")
+    print(f"Coverage:  2547XXXXXXXX (0–99,999,999) + 2541XXXXXXXX (100,000,000–199,999,999)")
+
+
+def cmd_upload(args) -> None:
+    try:
+        import boto3
+        from boto3.s3.transfer import TransferConfig
+    except ImportError:
+        sys.exit("boto3 is required for upload: pip install boto3")
+
+    db_path = Path(args.db)
+    if not db_path.exists():
+        sys.exit(f"Database not found: {db_path}\nBuild it first: python msisdn_lookup.py build")
+
+    size = db_path.stat().st_size
+    n_records = size // RECORD_SIZE
+    key = args.key or db_path.name
+
+    session = boto3.Session(profile_name=args.profile) if args.profile else boto3.Session()
+    s3 = session.client("s3", region_name=args.region)
+
+    print(f"Uploading {db_path}")
+    print(f"  → s3://{args.bucket}/{key}")
+    print(f"  Size:    {size / 1e9:.2f} GB")
+    print(f"  Records: {n_records:,}")
+
+    t0 = time.monotonic()
+    uploaded = [0]
+
+    def _progress(n: int) -> None:
+        uploaded[0] += n
+        pct = uploaded[0] / size * 100
+        print(
+            f"\r  {uploaded[0]/1e9:.2f} GB / {size/1e9:.2f} GB  ({pct:.0f}%)   ",
+            end="",
+            flush=True,
+        )
+
+    config = TransferConfig(
+        multipart_threshold=128 * 1024 * 1024,
+        multipart_chunksize=128 * 1024 * 1024,
+        max_concurrency=8,
+    )
+    s3.upload_file(str(db_path), args.bucket, key, Callback=_progress, Config=config)
+
+    elapsed = time.monotonic() - t0
+    print(f"\nDone in {elapsed:.1f}s")
+    print(f"S3 URI: s3://{args.bucket}/{key}")
+    print(f"Record count (set as LOOKUP_RECORD_COUNT env var): {n_records}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Reverse SHA256 hashes of Kenyan MPesa phone numbers (2547XXXXXXXX)",
+        description="Reverse SHA256 hashes of Kenyan MPesa phone numbers (2547/2541 XXXXXXXX)",
     )
     parser.add_argument(
         "--db",
@@ -257,7 +317,7 @@ def main() -> None:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_build = sub.add_parser("build", help="Build the lookup database (one-time, ~3.6 GB)")
+    p_build = sub.add_parser("build", help="Build the lookup database (one-time, ~7.2 GB)")
     p_build.add_argument(
         "--chunk-size",
         type=int,
@@ -283,6 +343,15 @@ def main() -> None:
 
     sub.add_parser("info", help="Show database stats")
 
+    p_upload = sub.add_parser("upload", help="Upload hashes.bin to S3 (requires boto3)")
+    p_upload.add_argument("bucket", help="S3 bucket name")
+    p_upload.add_argument("--key", default=None, metavar="KEY",
+                          help="S3 object key (default: hashes.bin)")
+    p_upload.add_argument("--region", default="us-east-1", metavar="REGION",
+                          help="AWS region (default: us-east-1)")
+    p_upload.add_argument("--profile", default=None, metavar="PROFILE",
+                          help="AWS credentials profile (e.g. arch-cli-user)")
+
     args = parser.parse_args()
 
     if args.command == "build":
@@ -291,6 +360,8 @@ def main() -> None:
         cmd_lookup(args)
     elif args.command == "info":
         cmd_info(args)
+    elif args.command == "upload":
+        cmd_upload(args)
 
 
 if __name__ == "__main__":

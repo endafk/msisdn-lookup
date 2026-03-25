@@ -13,8 +13,8 @@ from msisdn_lookup import (
     DEFAULT_DB,
     HASH_SIZE,
     RECORD_SIZE,
-    SUFFIX_DIGITS,
     _binary_search,
+    _decode_global_index,
 )
 
 DEFAULT_PORT = 8765
@@ -43,7 +43,8 @@ def lookup_hash(hash_hex: str) -> str | None:
 
     if suffix is None:
         return None
-    return f"7{suffix:0{SUFFIX_DIGITS}d}"
+    # _decode_global_index returns "254XXXXXXXXX"; strip the country code for display
+    return _decode_global_index(suffix)[3:]
 
 
 HTML = """<!DOCTYPE html>

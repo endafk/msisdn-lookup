@@ -1,4 +1,4 @@
-# Generated database — too large for git (3.6 GB). Build it locally with:
+# Generated database — too large for git (3.6 GB).
 #   python msisdn_lookup.py build
 hashes.bin
 *.bin.tmp

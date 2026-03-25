@@ -8,19 +8,23 @@ Reverse-lookup SHA256 hashes of Kenyan phone numbers from [MPesa Daraja API](htt
 
 ## The problem
 
-When MPesa Daraja API sends a payment callback, the subscriber's phone number is not returned in plain text — it arrives as a SHA256 hash:
+Safaricom's MPesa Daraja API used to include the subscriber's phone number in plain text (partially masked) in payment callbacks — for example, in C2B Pay Bill callbacks:
 
 ```json
 {
-  "Body": {
-    "stkCallback": {
-      "CallbackMetadata": {
-        "Item": [
-          { "Name": "PhoneNumber", "Value": "fc418dcfe94c732a..." }
-        ]
-      }
-    }
-  }
+  "TransactionType": "Pay Bill",
+  "TransID": "RKL51ZDR4F",
+  "TransTime": "20231121121325",
+  "TransAmount": "5.00",
+  "BusinessShortCode": "600966",
+  "BillRefNumber": "Sample Transaction",
+  "InvoiceNumber": "",
+  "OrgAccountBalance": "25.00",
+  "ThirdPartyTransID": "",
+  "MSISDN": "fc418dcfe94c732a...",  // ← SHA256 hash of the phone number (used to be plaintext e.g. "2547 ***** 126")
+  "FirstName": "NICHOLAS",
+  "MiddleName": "",
+  "LastName": ""
 }
 ```
 

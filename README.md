@@ -2,9 +2,44 @@
 
 Reverse-lookup SHA256 hashes of Kenyan phone numbers from [MPesa Daraja API](https://developer.safaricom.co.ke/) callbacks.
 
-The Daraja API returns the subscriber's phone number as a SHA256 hash. This tool pre-computes a lookup table covering all 200 million numbers across both Safaricom prefixes (`2547XXXXXXXX` and `2541XXXXXXXX`) so any hash can be reversed instantly.
-
 **No external dependencies for core usage — pure Python stdlib.**
+
+---
+
+## The problem
+
+When MPesa Daraja API sends a payment callback, the subscriber's phone number is not returned in plain text — it arrives as a SHA256 hash:
+
+```json
+{
+  "Body": {
+    "stkCallback": {
+      "CallbackMetadata": {
+        "Item": [
+          { "Name": "PhoneNumber", "Value": "fc418dcfe94c732a..." }
+        ]
+      }
+    }
+  }
+}
+```
+
+SHA256 is a one-way function — you cannot mathematically reverse it. The only way to recover the original phone number is to hash every possible candidate and check for a match.
+
+For Kenyan Safaricom numbers this means checking up to 200 million candidates (`2547XXXXXXXX` and `2541XXXXXXXX`). Doing that on every callback request is not viable.
+
+---
+
+## Why not other approaches
+
+| Approach | Lookup time | Notes |
+|---|---|---|
+| Brute-force per request | ~2 min | Hashes 200M numbers on every lookup. Completely unusable in practice. |
+| Store hashes in a database (SQLite, Postgres) | ~5–50 ms | Requires a DB server or large SQLite file (~15 GB with indexes), plus query overhead. |
+| Rainbow tables | Saves some space | Complex to implement correctly, slower than direct lookup, and the search space here is small enough not to need them. |
+| **Sorted binary file + binary search** | **< 1 ms** | Pre-computed once. No server, no dependencies. Memory-mapped reads mean the OS page cache warms up after the first few queries. |
+
+The key insight is that the phone number space is **closed and enumerable** — there are exactly 200 million valid numbers. That makes it practical to pre-hash all of them once, sort the results, and store them in a flat file. Every subsequent lookup is just a binary search: ~28 comparisons against a 7.2 GB file, completing in under a millisecond.
 
 ---
 
@@ -23,7 +58,7 @@ cd msisdn-lookup
 python msisdn_lookup.py build
 ```
 
-This generates `hashes.bin` in the project directory. It takes roughly **60–120 seconds** on a modern laptop (parallelised across all CPU cores). You only ever need to do this once.
+Generates `hashes.bin` in the project directory. Takes roughly **60–120 seconds** on a modern laptop (parallelised across all CPU cores). Only needs to be done once.
 
 > **Requires ~8 GB of free disk space.**
 
@@ -33,7 +68,7 @@ This generates `hashes.bin` in the project directory. It takes roughly **60–12
 python server.py
 ```
 
-Then open **http://localhost:8765** in your browser. Paste a hash, get the phone number back in `7XXXXXXXX` / `1XXXXXXXX` format with one click to copy.
+Open **http://localhost:8765**. Paste a hash, get the phone number back in `7XXXXXXXX` / `1XXXXXXXX` format with one click to copy.
 
 ---
 
@@ -72,7 +107,9 @@ hashlib.sha256(b"254700000001").hexdigest()
 # → 172509f6416f41d1ce3b78a757c1d4ce90fc1ab1c9d4cdf1edf25ab7bf3fbdfd
 ```
 
-The database is a flat binary file of 200 million 36-byte records `(hash[32], global_index[4])` sorted by hash. Lookups use a memory-mapped binary search (~28 comparisons) and return in under a millisecond once the OS page cache is warm.
+The database is a flat binary file of 200 million 36-byte records `(hash[32], global_index[4])` sorted by hash. At lookup time the file is memory-mapped and binary-searched in ~28 comparisons. Once the OS page cache warms up, repeated lookups are effectively instant.
+
+The build process parallelises across all CPU cores: each worker hashes and sorts a chunk of numbers independently, then the chunks are merged in a single streaming pass — keeping peak memory usage low regardless of chunk count.
 
 ---
 
@@ -94,7 +131,7 @@ python msisdn_lookup.py --db /path/to/hashes.bin lookup <hash>
 
 ### `info`
 ```
-python msisdn_lookup.py info                   # show database stats
+python msisdn_lookup.py info
 ```
 
 ### `upload` (requires `pip install boto3`)

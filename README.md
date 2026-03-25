@@ -117,6 +117,49 @@ The build process parallelises across all CPU cores: each worker hashes and sort
 
 ---
 
+## Using from AWS Lambda (S3 Range GET)
+
+You don't need to download the full 7.2 GB file inside a Lambda function. Because SHA256 hashes are **uniformly distributed**, the first 8 bytes of any target hash directly estimate its position in the sorted file. A single S3 Range GET of ~2 MB centred on that position is statistically guaranteed to contain the answer — resolving any number in one request, with no cold-start overhead.
+
+**Setup:**
+
+1. Upload `hashes.bin` to S3:
+```bash
+python msisdn_lookup.py upload my-s3-bucket
+# Prints LOOKUP_RECORD_COUNT at the end — save this value
+```
+
+2. Set environment variables on your Lambda:
+```
+LOOKUP_BUCKET=my-s3-bucket
+LOOKUP_KEY=hashes.bin
+LOOKUP_RECORD_COUNT=<value printed by upload command>
+```
+
+3. Grant the Lambda's execution role `s3:GetObject` on the bucket.
+
+**How the lookup works:**
+
+```
+target hash (hex) → first 8 bytes as uint64
+                  → scale to [0, RECORD_COUNT) via interpolation
+                  → fetch 2 MB block centred on estimated position (one Range GET)
+                  → binary search within the block
+                  → decode global index → phone number string
+```
+
+The 2 MB block covers ±55,000 records around the interpolated position — more than enough margin for the uniform distribution of SHA256 hashes. Every lookup costs exactly one S3 `GetObject` call (~20–30 ms).
+
+**Cost**
+
+An S3 Range GET costs $0.0004 per 1,000 requests. At 100,000 MPesa callbacks a month — a busy merchant — that's **$0.04**. Storage for `hashes.bin` is around **$0.17/month**. The total running cost is effectively zero.
+
+**Integrating with other functions**
+
+Any Lambda that receives an MPesa hash can do the same lookup — confirmation handlers, reconciliation jobs, analytics pipelines, CRM/Sheets sync functions. The file lives in S3 once and all functions share it. Each function just needs the three environment variables and `s3:GetObject` on the bucket; the lookup logic is self-contained and adds ~25 ms to any invocation that needs a phone number resolved.
+
+---
+
 ## Options
 
 ### `build`

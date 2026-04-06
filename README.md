@@ -172,7 +172,29 @@ target hash (hex) → first 8 bytes as uint64
                   → decode global index → phone number string
 ```
 
-The 2 MB block covers ±55,000 records around the interpolated position — more than enough margin for the uniform distribution of SHA256 hashes. Every lookup costs exactly one S3 `GetObject` call (~20–30 ms).
+**Interpolated position estimate:**
+
+SHA256 output is uniformly distributed over [0, 2⁶⁴). The first 8 bytes of the hash, read as a big-endian uint64, map linearly onto the sorted file:
+
+```
+p = ⌊(hash_prefix / 2⁶⁴) × N⌋
+
+hash_prefix  — first 8 bytes of target hash, interpreted as uint64
+N            — total record count (200,000,000)
+p            — estimated record index in the sorted file
+```
+
+The corresponding byte range for the centred 2 MB fetch:
+
+```
+RECORD_SIZE  = 36 bytes  (32-byte hash + 4-byte index)
+WINDOW       = 1,048,576 bytes  (1 MB on each side)
+
+byte_start   = max(0,       (p × RECORD_SIZE) − WINDOW)
+byte_end     = min(filesize, byte_start + 2 × WINDOW)
+```
+
+`2 × WINDOW / RECORD_SIZE ≈ 58,254 records` are fetched per call, centred on *p*. For a truly uniform distribution the actual record would never be more than a handful of positions away — the window exists purely as a conservative safety margin. Every lookup costs exactly one S3 `GetObject` call (~20–30 ms).
 
 **Cost**
 

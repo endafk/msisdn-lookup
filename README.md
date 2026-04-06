@@ -113,6 +113,30 @@ hashlib.sha256(b"254700000001").hexdigest()
 
 The database is a flat binary file of 200 million 36-byte records `(hash[32], global_index[4])` sorted by hash. At lookup time the file is memory-mapped and binary-searched in ~28 comparisons. Once the OS page cache warms up, repeated lookups are effectively instant.
 
+**Binary search:**
+
+Given a sorted file of *N* records, a lookup requires at most ⌈log₂(N)⌉ comparisons:
+
+```
+comparisons = ⌈log₂(N)⌉
+
+N = 200,000,000
+log₂(200,000,000) ≈ 27.575
+⌈27.575⌉ = 28
+```
+
+At each step, the search range halves:
+
+```
+mid = (low + high) // 2
+
+if hash[mid] == target → found
+if hash[mid]  < target → low  = mid + 1
+if hash[mid]  > target → high = mid - 1
+```
+
+28 comparisons against a 7.2 GB file. Sub-millisecond.
+
 The build process parallelises across all CPU cores: each worker hashes and sorts a chunk of numbers independently, then the chunks are merged in a single streaming pass — keeping peak memory usage low regardless of chunk count.
 
 ---

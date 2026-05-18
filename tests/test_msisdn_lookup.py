@@ -13,6 +13,7 @@ from msisdn_lookup import (
     NUMBERS_PER_PREFIX,
     PREFIXES,
     RECORD_SIZE,
+    STORED_HASH_SIZE,
     SUFFIX_SIZE,
     TOTAL_NUMBERS,
     _binary_search,
@@ -94,7 +95,7 @@ class TestDecodeGlobalIndex(unittest.TestCase):
 class TestBinarySearch(unittest.TestCase):
     def _make_db(self, indices):
         records = sorted(
-            _hash_number(i) + struct.pack(">I", i)
+            _hash_number(i)[:STORED_HASH_SIZE] + struct.pack(">I", i)
             for i in indices
         )
         f = tempfile.TemporaryFile()
@@ -172,12 +173,43 @@ class TestBinarySearch(unittest.TestCase):
         f.close()
 
 
-class TestConstants(unittest.TestCase):
-    def test_record_size_is_36(self):
-        self.assertEqual(RECORD_SIZE, 36)
+class TestBinarySearchVerification(unittest.TestCase):
+    """Binary search must re-hash and verify on hit so that a record whose
+    stored 10-byte prefix coincides with the target prefix but whose decoded
+    MSISDN does not actually hash to the target is rejected."""
 
-    def test_record_size_equals_hash_plus_suffix(self):
-        self.assertEqual(RECORD_SIZE, HASH_SIZE + SUFFIX_SIZE)
+    def test_rejects_planted_collision(self):
+        target = _hash_number(0)
+        planted = target[:STORED_HASH_SIZE] + struct.pack(">I", 42)
+        f = tempfile.TemporaryFile()
+        f.write(planted)
+        f.flush()
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            self.assertIsNone(_binary_search(mm, target, 1))
+        f.close()
+
+    def test_finds_correct_index_among_prefix_collisions(self):
+        real = _hash_number(0)
+        planted = real[:STORED_HASH_SIZE] + struct.pack(">I", 42)
+        real_record = real[:STORED_HASH_SIZE] + struct.pack(">I", 0)
+        records = sorted([planted, real_record])
+        f = tempfile.TemporaryFile()
+        f.write(b"".join(records))
+        f.flush()
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            self.assertEqual(_binary_search(mm, real, 2), 0)
+        f.close()
+
+
+class TestConstants(unittest.TestCase):
+    def test_record_size_is_14(self):
+        self.assertEqual(RECORD_SIZE, 14)
+
+    def test_record_size_equals_stored_hash_plus_suffix(self):
+        self.assertEqual(RECORD_SIZE, STORED_HASH_SIZE + SUFFIX_SIZE)
+
+    def test_stored_hash_smaller_than_full(self):
+        self.assertLess(STORED_HASH_SIZE, HASH_SIZE)
 
     def test_total_numbers(self):
         self.assertEqual(TOTAL_NUMBERS, 200_000_000)

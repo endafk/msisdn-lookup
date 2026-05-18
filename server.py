@@ -2,7 +2,6 @@
 import argparse
 import json
 import mmap
-import struct
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -11,7 +10,6 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).parent))
 from msisdn_lookup import (
     DEFAULT_DB,
-    HASH_SIZE,
     RECORD_SIZE,
     _binary_search,
     _decode_global_index,

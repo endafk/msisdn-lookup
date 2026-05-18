@@ -1,8 +1,13 @@
 # MSISDN Binary Search Hash Lookup
 
-Reverse-lookup SHA256 hashes of Kenyan phone numbers from [MPesa Daraja API](https://developer.safaricom.co.ke/) callbacks.
+[![test](https://github.com/endafk/msisdn-lookup/actions/workflows/test.yml/badge.svg)](https://github.com/endafk/msisdn-lookup/actions/workflows/test.yml)
+[![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![deps](https://img.shields.io/badge/dependencies-stdlib-lightgrey.svg)](https://github.com/endafk/msisdn-lookup)
 
-**No external dependencies for core usage — pure Python stdlib.**
+Reverse-lookup SHA256 hashes of Kenyan phone numbers from [MPesa Daraja API](https://developer.safaricom.co.ke/) callbacks. Sub-millisecond lookups against a 2.8 GB sorted binary file. Pure Python stdlib for the core; `boto3` only if you want S3 upload or Lambda.
+
+![web UI screenshot](docs/screenshot.png)
 
 ---
 
@@ -43,7 +48,9 @@ For Kenyan Safaricom numbers this means checking up to 200 million candidates (`
 | Rainbow tables | Saves some space | Complex to implement correctly, slower than direct lookup, and the search space here is small enough not to need them. |
 | **Sorted binary file + binary search** | **< 1 ms** | Pre-computed once. No server, no dependencies. Memory-mapped reads mean the OS page cache warms up after the first few queries. |
 
-The key insight is that the phone number space is **closed and enumerable** — there are exactly 200 million valid numbers. That makes it practical to pre-hash all of them once, sort the results, and store them in a flat file. Every subsequent lookup is just a binary search: ~28 comparisons against a 7.2 GB file, completing in under a millisecond.
+The key insight is that the phone number space is **closed and enumerable** — there are exactly 200 million valid numbers. That makes it practical to pre-hash all of them once, sort the results, and store them in a flat file. Every subsequent lookup is just a binary search: ~28 comparisons against a 2.8 GB file, completing in under a millisecond.
+
+> **Note on file size.** Each record stores the first 10 bytes (80 bits) of the SHA-256 plus a 4-byte index, for 14 bytes per record. Birthday-collision probability across all 200M MSISDNs is ~1.6 × 10⁻⁸, and lookups verify hits by re-hashing the recovered candidate against the full 32-byte input, so any in-DB collision is detected and resolved by scanning adjacent records.
 
 ---
 
@@ -56,7 +63,7 @@ git clone https://github.com/endafk/msisdn-lookup.git
 cd msisdn-lookup
 ```
 
-### 2. Build the database (one-time, ~7.2 GB)
+### 2. Build the database (one-time, ~2.8 GB)
 
 ```bash
 python msisdn_lookup.py build
@@ -64,7 +71,7 @@ python msisdn_lookup.py build
 
 Generates `hashes.bin` in the project directory. Takes roughly **60–120 seconds** on a modern laptop (parallelised across all CPU cores). Only needs to be done once.
 
-> **Requires ~8 GB of free disk space.**
+> **Requires ~4 GB of free disk space.**
 
 ### 3. Start the web UI
 
@@ -82,6 +89,9 @@ Open **http://localhost:8765**. Paste a hash, get the phone number back in `7XXX
 # Reverse a hash directly
 python msisdn_lookup.py lookup 172509f6416f41d1ce3b78a757c1d4ce90fc1ab1c9d4cdf1edf25ab7bf3fbdfd
 # → 254700000001
+
+# Batch-reverse many hashes from a file
+python msisdn_lookup.py batch hashes.txt -o resolved.csv
 
 # Show database stats
 python msisdn_lookup.py info
@@ -111,7 +121,7 @@ hashlib.sha256(b"254700000001").hexdigest()
 # → 172509f6416f41d1ce3b78a757c1d4ce90fc1ab1c9d4cdf1edf25ab7bf3fbdfd
 ```
 
-The database is a flat binary file of 200 million 36-byte records `(hash[32], global_index[4])` sorted by hash. At lookup time the file is memory-mapped and binary-searched in ~28 comparisons. Once the OS page cache warms up, repeated lookups are effectively instant.
+The database is a flat binary file of 200 million 14-byte records `(truncated_hash[10], global_index[4])` sorted by truncated hash. At lookup time the file is memory-mapped and binary-searched in ~28 comparisons. Once the OS page cache warms up, repeated lookups are effectively instant.
 
 **Binary search:**
 
@@ -135,7 +145,7 @@ if hash[mid]  < target → low  = mid + 1
 if hash[mid]  > target → high = mid - 1
 ```
 
-28 comparisons against a 7.2 GB file. Sub-millisecond.
+28 comparisons against a 2.8 GB file. Sub-millisecond.
 
 The build process parallelises across all CPU cores: each worker hashes and sorts a chunk of numbers independently, then the chunks are merged in a single streaming pass — keeping peak memory usage low regardless of chunk count.
 
@@ -143,7 +153,9 @@ The build process parallelises across all CPU cores: each worker hashes and sort
 
 ## Using from AWS Lambda (S3 Range GET)
 
-You don't need to download the full 7.2 GB file inside a Lambda function. Because SHA256 hashes are **uniformly distributed**, the first 8 bytes of any target hash directly estimate its position in the sorted file. A single S3 Range GET of ~2 MB centred on that position is statistically guaranteed to contain the answer — resolving any number in one request, with no cold-start overhead.
+You don't need to download the full 2.8 GB file inside a Lambda function. Because SHA256 hashes are **uniformly distributed**, the first 8 bytes of any target hash directly estimate its position in the sorted file. A single S3 Range GET of ~2 MB centred on that position is statistically guaranteed to contain the answer — resolving any number in one request, with no cold-start overhead.
+
+A ready-to-deploy handler lives in [`lambda/`](lambda/).
 
 **Setup:**
 
@@ -187,14 +199,14 @@ p            — estimated record index in the sorted file
 The corresponding byte range for the centred 2 MB fetch:
 
 ```
-RECORD_SIZE  = 36 bytes  (32-byte hash + 4-byte index)
+RECORD_SIZE  = 14 bytes  (10-byte hash prefix + 4-byte index)
 WINDOW       = 1,048,576 bytes  (1 MB on each side)
 
 byte_start   = max(0,       (p × RECORD_SIZE) − WINDOW)
 byte_end     = min(filesize, byte_start + 2 × WINDOW)
 ```
 
-`2 × WINDOW / RECORD_SIZE ≈ 58,254 records` are fetched per call, centred on *p*. For a truly uniform distribution the actual record would never be more than a handful of positions away — the window exists purely as a conservative safety margin. Every lookup costs exactly one S3 `GetObject` call (~20–30 ms).
+`2 × WINDOW / RECORD_SIZE ≈ 149,796 records` are fetched per call, centred on *p*. For a truly uniform distribution the actual record would never be more than a few thousand positions away — the window exists purely as a conservative safety margin. Every lookup costs exactly one S3 `GetObject` call (~20–30 ms).
 
 **Cost**
 
@@ -220,6 +232,13 @@ python msisdn_lookup.py build --force          # rebuild existing database
 ```
 python msisdn_lookup.py lookup <hash>
 python msisdn_lookup.py --db /path/to/hashes.bin lookup <hash>
+```
+
+### `batch`
+Reverse many hashes in one pass. Input is a text file with one hex hash per line; blank lines and `#` comments are skipped. Output is CSV (`hash,phone,status`) where `status` is `found`, `not_found`, or `invalid`.
+```
+python msisdn_lookup.py batch hashes.txt                 # CSV to stdout
+python msisdn_lookup.py batch hashes.txt -o resolved.csv
 ```
 
 ### `info`

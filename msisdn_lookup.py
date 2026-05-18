@@ -20,9 +20,14 @@ SUFFIX_DIGITS = 8
 NUMBERS_PER_PREFIX = 10 ** SUFFIX_DIGITS          # 100,000,000
 TOTAL_NUMBERS = NUMBERS_PER_PREFIX * len(PREFIXES) # 200,000,000
 
+# Full SHA-256 is 32 bytes. We only store the first 10 (80 bits) per record:
+# the prefix is long enough that across all 200M MSISDN hashes the probability
+# of any collision is ~200M^2 / 2^81 ~= 1.6e-8. On a hit we re-hash the
+# candidate and compare against the full 32-byte input to confirm.
 HASH_SIZE = 32
+STORED_HASH_SIZE = 10
 SUFFIX_SIZE = 4
-RECORD_SIZE = HASH_SIZE + SUFFIX_SIZE
+RECORD_SIZE = STORED_HASH_SIZE + SUFFIX_SIZE
 
 DEFAULT_DB = Path(__file__).parent / "hashes.bin"
 
@@ -45,7 +50,7 @@ def _build_chunk(args: tuple) -> str:
 
     records = []
     for global_idx in range(start, end):
-        h = _hash_number(global_idx)
+        h = _hash_number(global_idx)[:STORED_HASH_SIZE]
         records.append(h + struct.pack(">I", global_idx))
 
     records.sort()
@@ -189,14 +194,35 @@ def cmd_build(args) -> None:
 
 
 def _binary_search(mm: mmap.mmap, target: bytes, n_records: int) -> int | None:
+    if len(target) != HASH_SIZE:
+        raise ValueError(f"target must be {HASH_SIZE} bytes, got {len(target)}")
+    target_trunc = target[:STORED_HASH_SIZE]
+
     lo, hi = 0, n_records - 1
     while lo <= hi:
         mid = (lo + hi) >> 1
         offset = mid * RECORD_SIZE
-        record_hash = bytes(mm[offset : offset + HASH_SIZE])
-        if record_hash == target:
-            return struct.unpack(">I", mm[offset + HASH_SIZE : offset + RECORD_SIZE])[0]
-        elif record_hash < target:
+        rec_trunc = bytes(mm[offset : offset + STORED_HASH_SIZE])
+        if rec_trunc == target_trunc:
+            # walk left to the first record sharing this prefix, then scan
+            # right, re-hashing each candidate against the full target.
+            left = mid
+            while left > 0:
+                o = (left - 1) * RECORD_SIZE
+                if bytes(mm[o : o + STORED_HASH_SIZE]) != target_trunc:
+                    break
+                left -= 1
+            i = left
+            while i < n_records:
+                o = i * RECORD_SIZE
+                if bytes(mm[o : o + STORED_HASH_SIZE]) != target_trunc:
+                    break
+                idx = struct.unpack(">I", mm[o + STORED_HASH_SIZE : o + RECORD_SIZE])[0]
+                if _hash_number(idx) == target:
+                    return idx
+                i += 1
+            return None
+        elif rec_trunc < target_trunc:
             lo = mid + 1
         else:
             hi = mid - 1
@@ -237,6 +263,73 @@ def cmd_lookup(args) -> None:
         sys.exit(1)
 
     print(_decode_global_index(global_index))
+
+
+def cmd_batch(args) -> None:
+    db_path = Path(args.db)
+    in_path = Path(args.input)
+
+    if not db_path.exists():
+        sys.exit(
+            f"Database not found: {db_path}\n"
+            f"Run:  python msisdn_lookup.py build"
+        )
+    if not in_path.exists():
+        sys.exit(f"Input file not found: {in_path}")
+
+    db_size = db_path.stat().st_size
+    if db_size % RECORD_SIZE != 0:
+        sys.exit(
+            f"Error: database size {db_size} bytes is not a multiple of {RECORD_SIZE}. "
+            f"The file may be corrupt, or built with an older format. "
+            f"Rebuild with: python msisdn_lookup.py build --force"
+        )
+    n_records = db_size // RECORD_SIZE
+
+    out_file = open(args.output, "w", buffering=1) if args.output else sys.stdout
+    close_out = out_file is not sys.stdout
+
+    found = not_found = invalid = 0
+    t0 = time.monotonic()
+
+    try:
+        out_file.write("hash,phone,status\n")
+        with open(db_path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            with open(in_path, "r") as inp:
+                for raw in inp:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    h = line.lower()
+                    if len(h) != 64:
+                        out_file.write(f"{line},,invalid\n")
+                        invalid += 1
+                        continue
+                    try:
+                        target = bytes.fromhex(h)
+                    except ValueError:
+                        out_file.write(f"{line},,invalid\n")
+                        invalid += 1
+                        continue
+                    idx = _binary_search(mm, target, n_records)
+                    if idx is None:
+                        out_file.write(f"{h},,not_found\n")
+                        not_found += 1
+                    else:
+                        out_file.write(f"{h},{_decode_global_index(idx)},found\n")
+                        found += 1
+    finally:
+        if close_out:
+            out_file.close()
+
+    elapsed = time.monotonic() - t0
+    total = found + not_found + invalid
+    summary = f"{total} hashes processed in {elapsed:.2f}s ({found} found, {not_found} not found, {invalid} invalid)"
+    if args.output:
+        print(summary)
+        print(f"Wrote: {args.output}")
+    else:
+        print(summary, file=sys.stderr)
 
 
 def cmd_info(args) -> None:
@@ -317,7 +410,7 @@ def main() -> None:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_build = sub.add_parser("build", help="Build the lookup database (one-time, ~7.2 GB)")
+    p_build = sub.add_parser("build", help="Build the lookup database (one-time, ~2.8 GB)")
     p_build.add_argument(
         "--chunk-size",
         type=int,
@@ -341,6 +434,11 @@ def main() -> None:
     p_lookup = sub.add_parser("lookup", help="Reverse-lookup a SHA256 hash")
     p_lookup.add_argument("hash", help="64-char hex SHA256 hash")
 
+    p_batch = sub.add_parser("batch", help="Reverse-lookup many hashes from a file")
+    p_batch.add_argument("input", help="Text file: one hex hash per line (blank lines and # comments allowed)")
+    p_batch.add_argument("--output", "-o", default=None, metavar="PATH",
+                         help="CSV output path (default: stdout)")
+
     sub.add_parser("info", help="Show database stats")
 
     p_upload = sub.add_parser("upload", help="Upload hashes.bin to S3 (requires boto3)")
@@ -358,6 +456,8 @@ def main() -> None:
         cmd_build(args)
     elif args.command == "lookup":
         cmd_lookup(args)
+    elif args.command == "batch":
+        cmd_batch(args)
     elif args.command == "info":
         cmd_info(args)
     elif args.command == "upload":

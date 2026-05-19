@@ -2,7 +2,7 @@
 
 [![test](https://github.com/endafk/msisdn-lookup/actions/workflows/test.yml/badge.svg)](https://github.com/endafk/msisdn-lookup/actions/workflows/test.yml)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![license](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
 [![deps](https://img.shields.io/badge/dependencies-stdlib-lightgrey.svg)](https://github.com/endafk/msisdn-lookup)
 
 Reverse-lookup SHA256 hashes of Kenyan phone numbers from [MPesa Daraja API](https://developer.safaricom.co.ke/) callbacks. Sub-millisecond lookups against a 2.8 GB sorted binary file. Pure Python stdlib for the core; `boto3` only if you want S3 upload or Lambda.
